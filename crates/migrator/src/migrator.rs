@@ -65,13 +65,22 @@ fn migrate(text: &str, patterns: MigrationPatterns, query: &Query) -> Result<Opt
     }
 }
 
+/// Runs the provided migrations on the given text.
+/// Will automatically return `Ok(None)` if there's no content to migrate.
 fn run_migrations(text: &str, migrations: &[MigrationType]) -> Result<Option<String>> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+
     let mut current_text = text.to_string();
     let mut result: Option<String> = None;
     for migration in migrations.iter() {
         let migrated_text = match migration {
             MigrationType::TreeSitter(patterns, query) => migrate(&current_text, patterns, query)?,
             MigrationType::Json(callback) => {
+                if current_text.trim().is_empty() {
+                    return Ok(None);
+                }
                 let old_content: serde_json_lenient::Value =
                     settings::parse_json_with_comments(&current_text)?;
                 let old_value = serde_json::to_value(&old_content).unwrap();
@@ -369,6 +378,11 @@ mod tests {
     ) {
         let migrated = run_migrations(input, migrations).unwrap();
         assert_migrated_correctly(migrated, output);
+    }
+
+    #[test]
+    fn test_empty_content() {
+        assert_migrate_settings("", None)
     }
 
     #[test]
