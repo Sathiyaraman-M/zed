@@ -591,6 +591,11 @@ pub trait LanguageModel: Send + Sync {
         None
     }
 
+    /// Information about the cost of using this model, if available.
+    fn model_cost_info(&self) -> Option<LanguageModelCostInfo> {
+        None
+    }
+
     /// Whether this model supports extended thinking.
     fn supports_thinking(&self) -> bool {
         false
@@ -861,6 +866,19 @@ pub struct LanguageModelProviderId(pub SharedString);
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd)]
 pub struct LanguageModelProviderName(pub SharedString);
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LanguageModelCostInfo {
+    /// Cost per 1,000 input and output tokens
+    TokenCost {
+        input_token_cost_per_1m: f64,
+        output_token_cost_per_1m: f64,
+    },
+    /// Cost per request
+    RequestCost {
+        cost_per_request: f64,
+    },
+}
 
 impl LanguageModelProviderId {
     pub const fn new(id: &'static str) -> Self {
