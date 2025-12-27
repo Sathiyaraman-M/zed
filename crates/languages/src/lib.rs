@@ -20,6 +20,7 @@ use crate::{
 mod bash;
 mod c;
 mod cpp;
+mod csharp;
 mod css;
 mod eslint;
 mod go;
@@ -65,6 +66,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         ("bash", tree_sitter_bash::LANGUAGE),
         ("c", tree_sitter_c::LANGUAGE),
         ("cpp", tree_sitter_cpp::LANGUAGE),
+        ("csharp", tree_sitter_c_sharp::LANGUAGE),
         ("css", tree_sitter_css::LANGUAGE),
         ("diff", tree_sitter_diff::LANGUAGE),
         ("go", tree_sitter_go::LANGUAGE),
@@ -85,6 +87,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     ]);
 
     let c_lsp_adapter = Arc::new(c::CLspAdapter);
+    let csharp_lsp_adapter = Arc::new(csharp::CsharpLspAdapter);
     let css_lsp_adapter = Arc::new(css::CssLspAdapter::new(node.clone()));
     let eslint_adapter = Arc::new(eslint::EsLintLspAdapter::new(node.clone()));
     let go_context_provider = Arc::new(go::GoContextProvider);
@@ -125,6 +128,11 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         LanguageInfo {
             name: "cpp",
             adapters: vec![c_lsp_adapter],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "csharp",
+            adapters: vec![csharp_lsp_adapter.clone()],
             ..Default::default()
         },
         LanguageInfo {
@@ -275,6 +283,10 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     languages.register_available_lsp_adapter(
         LanguageServerName("typescript-language-server".into()),
         typescript_lsp_adapter,
+    );
+    languages.register_available_lsp_adapter(
+        LanguageServerName("roslyn".into()),
+        csharp_lsp_adapter.clone(),
     );
 
     languages.register_available_lsp_adapter(python_lsp_adapter.name(), python_lsp_adapter);
