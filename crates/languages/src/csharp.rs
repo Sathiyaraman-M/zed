@@ -1,7 +1,8 @@
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
+use collections::HashMap;
 use futures::StreamExt;
-use gpui::AsyncApp;
+use gpui::{App, AsyncApp, Task};
 use http_client::github::{AssetKind, GitHubLspBinaryVersion, latest_github_release};
 use http_client::github_download::{GithubBinaryMetadata, download_server_binary};
 pub use language::*;
@@ -9,11 +10,13 @@ use language::{LspAdapter, LspAdapterDelegate, LspInstaller, Toolchain};
 use lsp::{LanguageServerBinary, LanguageServerName, Uri};
 use project::lsp_store::language_server_settings;
 use smol::fs;
+use std::borrow::Cow;
 use std::{
     env::consts,
     path::{Path, PathBuf},
     sync::Arc,
 };
+use task::{TaskTemplate, TaskTemplates, TaskVariables, VariableName};
 use util::{ResultExt, fs::remove_matching, maybe};
 
 pub struct CsharpLspAdapter;
@@ -291,4 +294,177 @@ async fn get_cached_roslyn_binary(container_dir: PathBuf) -> Option<LanguageServ
     })
     .await
     .log_err()
+}
+
+pub(crate) struct CsharpContextProvider;
+
+const CS_PROJECT_TASK_VARIABLE: VariableName = VariableName::Custom(Cow::Borrowed("CS_PROJECT"));
+const CS_PROJECT_DIR_TASK_VARIABLE: VariableName =
+    VariableName::Custom(Cow::Borrowed("CS_PROJECT_DIR"));
+const CS_PROJECT_NAME_TASK_VARIABLE: VariableName =
+    VariableName::Custom(Cow::Borrowed("CS_PROJECT_NAME"));
+const CS_SOLUTION_TASK_VARIABLE: VariableName = VariableName::Custom(Cow::Borrowed("CS_SOLUTION"));
+
+impl ContextProvider for CsharpContextProvider {
+    fn build_context(
+        &self,
+        _variables: &TaskVariables,
+        location: ContextLocation<'_>,
+        _project_env: Option<HashMap<String, String>>,
+        _: Arc<dyn LanguageToolchainStore>,
+        cx: &mut App,
+    ) -> Task<Result<TaskVariables>> {
+        let local_abs_path = location
+            .file_location
+            .buffer
+            .read(cx)
+            .file()
+            .and_then(|file| Some(file.as_local()?.abs_path(cx)));
+
+        let project_vars = local_abs_path
+            .as_deref()
+            .and_then(|local_abs_path| local_abs_path.parent())
+            .and_then(|buffer_dir| {
+                let mut found_csproj: Option<PathBuf> = None;
+                let mut found_sln: Option<PathBuf> = None;
+
+                for ancestor in buffer_dir.ancestors() {
+                    if let Ok(entries) = std::fs::read_dir(ancestor) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_file() {
+                                if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                                    if ext.eq_ignore_ascii_case("csproj") {
+                                        found_csproj = Some(p.clone());
+                                        break;
+                                    } else if ext.eq_ignore_ascii_case("sln") && found_sln.is_none()
+                                    {
+                                        found_sln = Some(p.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if found_csproj.is_some() {
+                        break;
+                    }
+                }
+
+                let found = found_csproj.or(found_sln)?;
+
+                let project = found.to_string_lossy().into_owned();
+                let project_dir = found
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| ".".to_string());
+                let project_name = found
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+
+                let solution_tuple = if found
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("sln"))
+                    .unwrap_or(false)
+                {
+                    Some((
+                        CS_SOLUTION_TASK_VARIABLE.clone(),
+                        found
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                };
+
+                Some(TaskVariables::from_iter(
+                    [
+                        Some((CS_PROJECT_TASK_VARIABLE.clone(), project)),
+                        Some((CS_PROJECT_DIR_TASK_VARIABLE.clone(), project_dir)),
+                        Some((CS_PROJECT_NAME_TASK_VARIABLE.clone(), project_name)),
+                        solution_tuple,
+                    ]
+                    .into_iter()
+                    .flatten(),
+                ))
+            });
+
+        Task::ready(Ok(project_vars.unwrap_or_default()))
+    }
+
+    fn associated_tasks(&self, _: Option<Arc<dyn File>>, _: &App) -> Task<Option<TaskTemplates>> {
+        Task::ready(Some(TaskTemplates(vec![
+            TaskTemplate {
+                label: format!("Build: {}", CS_PROJECT_TASK_VARIABLE.template_value()),
+                command: "dotnet".into(),
+                args: vec!["build".into(), CS_PROJECT_TASK_VARIABLE.template_value()],
+                cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
+                tags: vec!["dotnet-build".to_owned()],
+                ..TaskTemplate::default()
+            },
+            TaskTemplate {
+                label: format!("Run: {}", CS_PROJECT_TASK_VARIABLE.template_value()),
+                command: "dotnet".into(),
+                args: vec![
+                    "run".into(),
+                    "--project".into(),
+                    CS_PROJECT_TASK_VARIABLE.template_value(),
+                ],
+                cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
+                tags: vec!["dotnet-run".to_owned()],
+                ..TaskTemplate::default()
+            },
+            TaskTemplate {
+                label: format!("Test: {}", CS_PROJECT_TASK_VARIABLE.template_value()),
+                command: "dotnet".into(),
+                args: vec!["test".into(), CS_PROJECT_TASK_VARIABLE.template_value()],
+                cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
+                tags: vec!["dotnet-test".to_owned()],
+                ..TaskTemplate::default()
+            },
+            TaskTemplate {
+                label: "Test (symbol)".to_owned(),
+                command: "dotnet".into(),
+                args: vec![
+                    "test".into(),
+                    CS_PROJECT_TASK_VARIABLE.template_value(),
+                    "--filter".into(),
+                    format!(
+                        "FullyQualifiedName~{}",
+                        VariableName::Symbol.template_value()
+                    ),
+                ],
+                cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
+                tags: vec!["dotnet-test-symbol".to_owned()],
+                ..TaskTemplate::default()
+            },
+            TaskTemplate {
+                label: format!("Restore: {}", CS_PROJECT_TASK_VARIABLE.template_value()),
+                command: "dotnet".into(),
+                args: vec!["restore".into(), CS_PROJECT_TASK_VARIABLE.template_value()],
+                cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
+                tags: vec!["dotnet-restore".to_owned()],
+                ..TaskTemplate::default()
+            },
+            TaskTemplate {
+                label: format!(
+                    "Publish (Release): {}",
+                    CS_PROJECT_TASK_VARIABLE.template_value()
+                ),
+                command: "dotnet".into(),
+                args: vec![
+                    "publish".into(),
+                    "--project".into(),
+                    CS_PROJECT_TASK_VARIABLE.template_value(),
+                    "-c".into(),
+                    "Release".into(),
+                ],
+                cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
+                tags: vec!["dotnet-publish".to_owned()],
+                ..TaskTemplate::default()
+            },
+        ])))
+    }
 }

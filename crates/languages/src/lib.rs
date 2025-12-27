@@ -88,6 +88,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
 
     let c_lsp_adapter = Arc::new(c::CLspAdapter);
     let csharp_lsp_adapter = Arc::new(csharp::CsharpLspAdapter);
+    let csharp_context_provider = Arc::new(csharp::CsharpContextProvider);
     let css_lsp_adapter = Arc::new(css::CssLspAdapter::new(node.clone()));
     let eslint_adapter = Arc::new(eslint::EsLintLspAdapter::new(node.clone()));
     let go_context_provider = Arc::new(go::GoContextProvider);
@@ -133,6 +134,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         LanguageInfo {
             name: "csharp",
             adapters: vec![csharp_lsp_adapter.clone()],
+            context: Some(csharp_context_provider.clone()),
             ..Default::default()
         },
         LanguageInfo {
