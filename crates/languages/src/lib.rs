@@ -67,6 +67,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         ("c", tree_sitter_c::LANGUAGE),
         ("cpp", tree_sitter_cpp::LANGUAGE),
         ("csharp", tree_sitter_c_sharp::LANGUAGE),
+        ("csproj", tree_sitter_xml::LANGUAGE_XML),
         ("css", tree_sitter_css::LANGUAGE),
         ("diff", tree_sitter_diff::LANGUAGE),
         ("go", tree_sitter_go::LANGUAGE),
@@ -175,6 +176,10 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             name: "jsonc",
             adapters: vec![json_lsp_adapter],
             context: Some(json_context_provider),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "csproj",
             ..Default::default()
         },
         LanguageInfo {
@@ -402,6 +407,26 @@ pub fn language(name: &str, grammar: tree_sitter::Language) -> Arc<Language> {
             .with_queries(load_queries(name))
             .unwrap(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csproj_config_loads() {
+        // Load the language configuration directly to avoid accessing private fields on `Language`.
+        let cfg = load_config("csproj");
+
+        // Basic sanity checks against the configuration we added.
+        assert_eq!(cfg.name.as_ref(), "MSBuild Project");
+        assert_eq!(cfg.grammar.as_deref(), Some("xml"));
+
+        // Ensure the path suffixes include common MSBuild file extensions.
+        assert!(cfg.matcher.path_suffixes.iter().any(|s| s == "csproj"));
+        assert!(cfg.matcher.path_suffixes.iter().any(|s| s == "props"));
+        assert!(cfg.matcher.path_suffixes.iter().any(|s| s == "targets"));
+    }
 }
 
 fn load_config(name: &str) -> LanguageConfig {
