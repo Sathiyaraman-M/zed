@@ -133,7 +133,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         LanguageInfo {
             name: "csharp",
             adapters: vec![csharp_lsp_adapter.clone()],
-            context: Some(csharp_context_provider.clone()),
+            context: Some(csharp_context_provider),
             ..Default::default()
         },
         LanguageInfo {
@@ -287,7 +287,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     );
     languages.register_available_lsp_adapter(
         LanguageServerName("roslyn".into()),
-        csharp_lsp_adapter.clone(),
+        csharp_lsp_adapter,
     );
 
     languages.register_available_lsp_adapter(python_lsp_adapter.name(), python_lsp_adapter);
