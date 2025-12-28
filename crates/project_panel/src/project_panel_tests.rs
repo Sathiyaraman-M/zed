@@ -105,6 +105,77 @@ async fn test_visible_list(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_solution_explorer_opens(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/proj"),
+        json!({
+            "MySolution.sln": "",
+            "ProjectA": { "A.csproj": "" }
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/proj").as_ref()], cx).await;
+    let workspace = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+    let cx = &mut VisualTestContext::from_window(*workspace, cx);
+    // instantiate the docked Solution Explorer panel in the workspace and ensure it updates.
+    let panel = workspace.update(cx, SolutionExplorerPanel::new).unwrap();
+    cx.run_until_parked();
+
+    // Check that we have discovered entries for the worktree we seeded.
+    let discovered = panel.read_with(cx, |panel, _| panel.discovered.clone());
+    assert!(!discovered.is_empty());
+}
+
+#[gpui::test]
+async fn test_toggle_solution_explorer_focus(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/proj"),
+        json!({
+            "MySolution.sln": "",
+            "ProjectA": { "A.csproj": "" }
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/proj").as_ref()], cx).await;
+    let workspace = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
+    let cx = &mut VisualTestContext::from_window(*workspace, cx);
+
+    // Create and add the panel to the workspace docks so the action can focus it.
+    let panel = workspace.update(cx, SolutionExplorerPanel::new).unwrap();
+    let _ = workspace.update(cx, |workspace, window, cx| {
+        workspace.add_panel(panel.clone(), window, cx)
+    });
+    cx.run_until_parked();
+
+    // Ensure panel starts unfocused.
+    let _ = workspace.update(cx, |_, window, cx| {
+        assert!(!panel.focus_handle(cx).contains_focused(window, cx));
+    });
+
+    // Toggle the panel - should focus the panel (returns true).
+    let _ = workspace.update(cx, |workspace, window, cx| {
+        let did_focus = workspace.toggle_panel_focus::<SolutionExplorerPanel>(window, cx);
+        assert!(did_focus);
+    });
+    cx.run_until_parked();
+
+    // Toggle again - should unfocus (returns false).
+    let _ = workspace.update(cx, |workspace, window, cx| {
+        let did_focus = workspace.toggle_panel_focus::<SolutionExplorerPanel>(window, cx);
+        assert!(!did_focus);
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
 async fn test_opening_file(cx: &mut gpui::TestAppContext) {
     init_test_with_editor(cx);
 
