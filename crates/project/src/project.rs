@@ -230,6 +230,8 @@ pub struct Project {
     buffers_needing_diff: HashSet<WeakEntity<Buffer>>,
     git_diff_debouncer: DebouncedDelay<Self>,
     remotely_created_models: Arc<Mutex<RemotelyCreatedModels>>,
+    // Discovered project files (e.g., `.sln` / `.csproj`) for each worktree.
+    discovered_projects: HashMap<WorktreeId, HashSet<ProjectEntryId>>,
     terminals: Terminals,
     node: Option<NodeRuntime>,
     search_history: SearchHistory,
@@ -347,6 +349,8 @@ pub enum Event {
     WorktreeOrderChanged,
     WorktreeRemoved(WorktreeId),
     WorktreeUpdatedEntries(WorktreeId, UpdatedEntriesSet),
+    /// Emitted when discovered project files (e.g., `.sln` / `.csproj`) change for a worktree.
+    DiscoveredProjectFiles(WorktreeId, Vec<ProjectEntryId>),
     DiskBasedDiagnosticsStarted {
         language_server_id: LanguageServerId,
     },
@@ -1258,6 +1262,7 @@ impl Project {
             Self {
                 buffer_ordered_messages_tx: tx,
                 collaborators: Default::default(),
+                discovered_projects: Default::default(),
                 worktree_store,
                 buffer_store,
                 image_store,
@@ -1471,6 +1476,7 @@ impl Project {
             let this = Self {
                 buffer_ordered_messages_tx: tx,
                 collaborators: Default::default(),
+                discovered_projects: Default::default(),
                 worktree_store,
                 buffer_store,
                 image_store,
@@ -1764,6 +1770,7 @@ impl Project {
                 context_server_store,
                 active_entry: None,
                 collaborators: Default::default(),
+                discovered_projects: Default::default(),
                 join_project_response_message_id: response.message_id,
                 languages,
                 user_store: user_store.clone(),
@@ -3470,6 +3477,43 @@ impl Project {
             WorktreeStoreEvent::WorktreeOrderChanged => cx.emit(Event::WorktreeOrderChanged),
             WorktreeStoreEvent::WorktreeUpdateSent(_) => {}
             WorktreeStoreEvent::WorktreeUpdatedEntries(worktree_id, changes) => {
+                // Update our discovered project entries for this worktree.
+                let mut changed_entries: Vec<ProjectEntryId> = Vec::new();
+                {
+                    let set = self
+                        .discovered_projects
+                        .entry(*worktree_id)
+                        .or_insert_with(Default::default);
+                    for (path, entry_id, change) in changes.iter() {
+                        let file_name_lower = path.as_unix_str().to_ascii_lowercase();
+                        let is_project_file = file_name_lower.ends_with(".csproj")
+                            || file_name_lower.ends_with(".fsproj")
+                            || file_name_lower.ends_with(".vbproj")
+                            || file_name_lower.ends_with(".sln")
+                            || file_name_lower.ends_with("global.json")
+                            || file_name_lower.ends_with("directory.build.props");
+
+                        match change {
+                            PathChange::Removed => {
+                                if set.remove(entry_id) {
+                                    changed_entries.push(*entry_id);
+                                }
+                            }
+                            _ => {
+                                if is_project_file && set.insert(*entry_id) {
+                                    changed_entries.push(*entry_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !changed_entries.is_empty() {
+                    cx.emit(Event::DiscoveredProjectFiles(
+                        *worktree_id,
+                        changed_entries.clone(),
+                    ));
+                }
+
                 self.client()
                     .telemetry()
                     .report_discovered_project_type_events(*worktree_id, changes);
@@ -3481,6 +3525,38 @@ impl Project {
             // Listen to the GitStore instead.
             WorktreeStoreEvent::WorktreeUpdatedGitRepositories(_, _) => {}
         }
+    }
+
+    /// Returns the discovered project entry ids (e.g., `.sln`, `.csproj`) for the given worktree.
+    pub fn discovered_project_entry_ids_for_worktree(
+        &self,
+        worktree_id: WorktreeId,
+    ) -> Vec<ProjectEntryId> {
+        self.discovered_projects
+            .get(&worktree_id)
+            .map(|s| s.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
+    }
+
+    /// Returns the discovered project paths (as `ProjectPath`) for the given worktree.
+    /// This maps the internally stored entry ids to their project-relative paths.
+    pub fn discovered_projects_for_worktree(
+        &self,
+        worktree_id: WorktreeId,
+        cx: &App,
+    ) -> Vec<ProjectPath> {
+        self.discovered_project_entry_ids_for_worktree(worktree_id)
+            .into_iter()
+            .filter_map(|entry_id| {
+                self.worktree_store
+                    .read(cx)
+                    .worktree_and_entry_for_id(entry_id, cx)
+                    .map(|(worktree, entry)| ProjectPath {
+                        worktree_id: worktree.read(cx).id(),
+                        path: entry.path.clone(),
+                    })
+            })
+            .collect()
     }
 
     fn on_worktree_added(&mut self, worktree: &Entity<Worktree>, _: &mut Context<Self>) {

@@ -78,6 +78,7 @@ use worktree::CreatedEntry;
 use zed_actions::{project_panel::ToggleFocus, workspace::OpenWithSystem};
 
 const PROJECT_PANEL_KEY: &str = "ProjectPanel";
+const SOLUTION_EXPLORER_PANEL_KEY: &str = "SolutionExplorerPanel";
 const NEW_ENTRY_ID: ProjectEntryId = ProjectEntryId::MAX;
 
 struct VisibleEntriesForWorktree {
@@ -346,6 +347,8 @@ actions!(
         SelectPrevDirectory,
         /// Opens a diff view to compare two marked files.
         CompareMarkedFiles,
+        /// Opens the Solution Explorer (lists discovered solutions/projects)
+        ToggleSolutionExplorer,
     ]
 );
 
@@ -399,6 +402,9 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ProjectPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &ToggleSolutionExplorer, window, cx| {
+            workspace.toggle_panel_focus::<SolutionExplorerPanel>(window, cx);
         });
 
         workspace.register_action(|workspace, _: &ToggleHideGitIgnore, _, cx| {
@@ -5887,6 +5893,312 @@ impl ProjectPanel {
                     .into_any()
             })
             .collect()
+    }
+}
+
+// A docked Solution Explorer panel which lists discovered solutions/projects grouped by worktree.
+pub struct SolutionExplorerPanel {
+    project: Entity<Project>,
+    workspace: WeakEntity<Workspace>,
+    // discovered ProjectPaths grouped by WorktreeId
+    discovered: HashMap<WorktreeId, Vec<ProjectPath>>,
+    // expanded directory prefixes per worktree (not persisted yet)
+    expanded_dirs: HashMap<WorktreeId, HashSet<Arc<RelPath>>>,
+    focus_handle: FocusHandle,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl SolutionExplorerPanel {
+    /// Create a new SolutionExplorerPanel and add it to the workspace docks.
+    pub fn new(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<SolutionExplorerPanel> {
+        let project = workspace.project().clone();
+
+        // Initialize discovered entries for currently visible worktrees before creating the panel.
+        let discovered_map: HashMap<WorktreeId, Vec<ProjectPath>> = {
+            let mut map = HashMap::default();
+            for worktree in project.read(cx).visible_worktrees(cx) {
+                let id = worktree.read(cx).id();
+                let entries = project.read(cx).discovered_projects_for_worktree(id, cx);
+                if !entries.is_empty() {
+                    map.insert(id, entries);
+                }
+            }
+            map
+        };
+
+        let panel = cx.new(|cx| SolutionExplorerPanel {
+            project: project.clone(),
+            workspace: workspace.weak_handle(),
+            discovered: discovered_map,
+            expanded_dirs: HashMap::default(),
+            focus_handle: cx.focus_handle(),
+            _subscriptions: Vec::new(),
+        });
+
+        // Subscribe to project events and refresh cache on relevant updates.
+        let panel_weak = panel.downgrade();
+        cx.subscribe_in(&project, window, move |_, _, event, _, cx| match event {
+            project::Event::DiscoveredProjectFiles(worktree_id, _)
+            | project::Event::WorktreeUpdatedEntries(worktree_id, _)
+            | project::Event::WorktreeAdded(worktree_id)
+            | project::Event::WorktreeRemoved(worktree_id) => {
+                panel_weak
+                    .update(cx, |panel, panel_cx| {
+                        let entries = panel
+                            .project
+                            .read(panel_cx)
+                            .discovered_projects_for_worktree(*worktree_id, panel_cx);
+                        if entries.is_empty() {
+                            panel.discovered.remove(worktree_id);
+                        } else {
+                            panel.discovered.insert(*worktree_id, entries);
+                        }
+                    })
+                    .ok();
+            }
+            _ => {}
+        })
+        .detach();
+
+        panel
+    }
+
+    /// Attempt to open the given project path in this panel's workspace, if the workspace
+    /// contains the same worktree. Otherwise, do nothing (per your spec).
+    fn open_in_workspace_if_matches(
+        &self,
+        worktree_id: WorktreeId,
+        pp: &ProjectPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ws) = self.workspace.upgrade() {
+            // Check whether this workspace contains the requested worktree
+            let contains = ws
+                .read(cx)
+                .project()
+                .read(cx)
+                .worktree_for_id(worktree_id, cx)
+                .is_some();
+            if !contains {
+                return;
+            }
+
+            // Resolve absolute path and schedule an open on the window if possible.
+            if let Some(abs) = self
+                .project
+                .read(cx)
+                .worktree_store()
+                .read(cx)
+                .absolutize(pp, cx)
+            {
+                let abs_clone = abs.clone();
+                let ws_clone = ws.clone();
+                // Spawn a task on the window to perform the open operation.
+                let _ = window.spawn(cx, async move |cx| {
+                    match ws_clone.update_in(cx, |ws, window, cx| {
+                        ws.open_paths(
+                            vec![abs_clone.clone()],
+                            OpenOptions {
+                                visible: Some(OpenVisible::All),
+                                ..Default::default()
+                            },
+                            None,
+                            window,
+                            cx,
+                        )
+                    }) {
+                        Ok(task) => {
+                            let _ = task.await;
+                        }
+                        Err(_) => {}
+                    }
+                    Ok::<(), anyhow::Error>(())
+                });
+            }
+        }
+    }
+
+    // Helper: build a simple tree-like rendering for a set of project paths.
+    fn render_worktree_nodes(
+        &mut self,
+        worktree_id: WorktreeId,
+        paths: &[ProjectPath],
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // Simple approach: render as an indented list using path components
+        let mut list = v_flex();
+        for pp in paths.iter() {
+            let display = pp.path.as_unix_str().to_string();
+            let pp_clone = pp.clone();
+            let wid = worktree_id;
+            list = list.child(div().py_1().child(
+                Button::new(format!("sln-panel-id-{}", display), display.clone()).on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_in_workspace_if_matches(wid, &pp_clone, window, cx);
+                    }),
+                ),
+            ));
+        }
+        list
+    }
+
+    /// Load the Solution Explorer panel for the given workspace.
+    /// This mirrors the pattern used by other panels (e.g., `ProjectPanel::load`) so the panel
+    /// can be created as part of workspace initialization.
+    pub async fn load(
+        workspace: WeakEntity<Workspace>,
+        mut cx: AsyncWindowContext,
+    ) -> Result<Entity<Self>> {
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            SolutionExplorerPanel::new(workspace, window, cx)
+        })
+    }
+}
+
+impl Render for SolutionExplorerPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut container = v_flex().child(Label::new("Solution Explorer").size(LabelSize::Large));
+
+        // For deterministic iteration, sort the worktree ids.
+        let mut worktree_ids: Vec<_> = self.discovered.keys().copied().collect();
+        worktree_ids.sort_unstable();
+
+        for wid in worktree_ids {
+            if let Some(items) = self.discovered.clone().get(&wid) {
+                if items.is_empty() {
+                    continue;
+                }
+                // Worktree header (show absolute root path)
+                if let Some(worktree) = self.project.read(cx).worktree_for_id(wid, cx) {
+                    let root = worktree.read(cx).abs_path().display().to_string();
+                    container = container.child(div().py_1().child(Label::new(root)));
+                }
+                // Render discovered entries for this worktree in a simple tree-like list
+                container =
+                    container.child(self.render_worktree_nodes(wid, items.as_slice(), window, cx));
+            }
+        }
+
+        container
+    }
+}
+
+impl EventEmitter<PanelEvent> for SolutionExplorerPanel {}
+
+impl Panel for SolutionExplorerPanel {
+    fn persistent_name() -> &'static str {
+        "Solution Explorer"
+    }
+
+    fn panel_key() -> &'static str {
+        SOLUTION_EXPLORER_PANEL_KEY
+    }
+
+    fn position(&self, _: &Window, _cx: &App) -> DockPosition {
+        DockPosition::Left
+    }
+
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        matches!(position, DockPosition::Left | DockPosition::Right)
+    }
+
+    fn set_position(
+        &mut self,
+        _position: DockPosition,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        // No persistent position for now.
+    }
+
+    fn size(&self, _: &Window, _cx: &App) -> Pixels {
+        px(300.)
+    }
+
+    fn set_size(&mut self, _size: Option<Pixels>, _window: &mut Window, _cx: &mut Context<Self>) {
+        // no-op
+    }
+
+    fn icon(&self, _window: &Window, _cx: &App) -> Option<ui::IconName> {
+        Some(IconName::FileTree)
+    }
+
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
+        Some("Solution Explorer")
+    }
+
+    fn toggle_action(&self) -> Box<dyn Action> {
+        Box::new(ToggleSolutionExplorer)
+    }
+
+    fn starts_open(&self, _: &Window, _cx: &App) -> bool {
+        false
+    }
+
+    fn activation_priority(&self) -> u32 {
+        7
+    }
+}
+
+impl Focusable for SolutionExplorerPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+/// Minimal Solution Explorer view for quick testing.
+/// Displays discovered solutions/projects grouped by worktree.
+pub struct SolutionExplorer {
+    project: Entity<Project>,
+}
+
+impl SolutionExplorer {
+    pub fn new(project: Entity<Project>, _window: &mut Window, _cx: &mut Context<Self>) -> Self {
+        SolutionExplorer { project }
+    }
+}
+
+impl Render for SolutionExplorer {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut container = v_flex();
+
+        // Iterate visible worktrees and show discovered project files beneath each header.
+        for worktree in self.project.read(cx).visible_worktrees(cx) {
+            let worktree_id = worktree.read(cx).id();
+            let abs_path_display = worktree.read(cx).abs_path().display().to_string();
+            let header = div().child(Label::new(abs_path_display));
+            container = container.child(header);
+
+            let items = self
+                .project
+                .read(cx)
+                .discovered_projects_for_worktree(worktree_id, cx);
+
+            if items.is_empty() {
+                container =
+                    container.child(Label::new("(no discovered projects)").size(LabelSize::Small));
+            } else {
+                let mut list = v_flex();
+                for pp in items {
+                    let display = pp.path.as_unix_str().to_string();
+                    let display_clone = display.clone();
+                    list = list.child(
+                        Label::new(display_clone.clone()), //     .on_click(move |_, _, _| {
+                                                           //     log::info!("Solution Explorer clicked: {}", display_clone);
+                                                           // }),
+                    );
+                }
+                container = container.child(list);
+            }
+        }
+
+        container.into_any_element()
     }
 }
 
