@@ -2,7 +2,7 @@ use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use collections::HashMap;
 use futures::StreamExt;
-use gpui::{App, AsyncApp, Task};
+use gpui::{App, AppContext, AsyncApp, Task};
 use http_client::github::{AssetKind, GitHubLspBinaryVersion, latest_github_release};
 use http_client::github_download::{GithubBinaryMetadata, download_server_binary};
 pub use language::*;
@@ -16,7 +16,10 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use task::{TaskTemplate, TaskTemplates, TaskVariables, VariableName};
+use task::{
+    HideStrategy, RevealStrategy, RevealTarget, TaskTemplate, TaskTemplates, TaskVariables,
+    VariableName,
+};
 use util::{ResultExt, fs::remove_matching, maybe};
 
 pub struct CsharpLspAdapter;
@@ -394,65 +397,157 @@ impl ContextProvider for CsharpContextProvider {
         Task::ready(Ok(project_vars.unwrap_or_default()))
     }
 
-    fn associated_tasks(&self, _: Option<Arc<dyn File>>, _: &App) -> Task<Option<TaskTemplates>> {
-        Task::ready(Some(TaskTemplates(vec![
-            TaskTemplate {
-                label: format!("Build: {}", CS_PROJECT_TASK_VARIABLE.template_value()),
+    fn associated_tasks(
+        &self,
+        file: Option<Arc<dyn File>>,
+        cx: &App,
+    ) -> Task<Option<TaskTemplates>> {
+        let Some(file) = project::File::from_dyn(file.as_ref()).cloned() else {
+            return Task::ready(None);
+        };
+        let Some(worktree_root) = file.worktree.read(cx).root_dir() else {
+            return Task::ready(None);
+        };
+        let file_relative_path = file.path().clone();
+
+        cx.background_spawn(async move {
+            // Locate the nearest `.csproj` (preferred) or `.sln` ancestor, like `build_context`.
+            let start = worktree_root.join(file_relative_path.as_unix_str());
+            let buffer_dir = start
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| worktree_root.to_path_buf());
+
+            let mut found_csproj: Option<PathBuf> = None;
+            let mut found_sln: Option<PathBuf> = None;
+
+            for ancestor in buffer_dir.ancestors() {
+                if let Ok(entries) = std::fs::read_dir(ancestor) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_file() {
+                            if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                                if ext.eq_ignore_ascii_case("csproj") {
+                                    found_csproj = Some(p.clone());
+                                    break;
+                                } else if ext.eq_ignore_ascii_case("sln") && found_sln.is_none() {
+                                    found_sln = Some(p.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                if found_csproj.is_some() {
+                    break;
+                }
+            }
+
+            let project_path = match found_csproj.or(found_sln) {
+                Some(p) => p,
+                None => return None,
+            };
+
+            let mut task_templates: Vec<TaskTemplate> = Vec::new();
+
+            // Always provide a build task.
+            task_templates.push(TaskTemplate {
+                label: "Build current project".into(),
                 command: "dotnet".into(),
                 args: vec!["build".into(), CS_PROJECT_TASK_VARIABLE.template_value()],
                 cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
                 tags: vec!["dotnet-build".to_owned()],
                 ..TaskTemplate::default()
-            },
-            TaskTemplate {
-                label: format!("Run: {}", CS_PROJECT_TASK_VARIABLE.template_value()),
-                command: "dotnet".into(),
-                args: vec![
-                    "run".into(),
-                    "--project".into(),
-                    CS_PROJECT_TASK_VARIABLE.template_value(),
-                ],
-                cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
-                tags: vec!["dotnet-run".to_owned()],
-                ..TaskTemplate::default()
-            },
-            TaskTemplate {
-                label: format!("Test: {}", CS_PROJECT_TASK_VARIABLE.template_value()),
-                command: "dotnet".into(),
-                args: vec!["test".into(), CS_PROJECT_TASK_VARIABLE.template_value()],
-                cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
-                tags: vec!["dotnet-test".to_owned()],
-                ..TaskTemplate::default()
-            },
-            TaskTemplate {
-                label: "Test (symbol)".to_owned(),
-                command: "dotnet".into(),
-                args: vec![
-                    "test".into(),
-                    CS_PROJECT_TASK_VARIABLE.template_value(),
-                    "--filter".into(),
-                    format!(
-                        "FullyQualifiedName~{}",
-                        VariableName::Symbol.template_value()
-                    ),
-                ],
-                cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
-                tags: vec!["dotnet-test-symbol".to_owned()],
-                ..TaskTemplate::default()
-            },
-            TaskTemplate {
-                label: format!("Restore: {}", CS_PROJECT_TASK_VARIABLE.template_value()),
+            });
+
+            // For a .csproj, try to detect capabilities via MSBuild properties.
+            let is_csproj = project_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|e| e.eq_ignore_ascii_case("csproj"))
+                .unwrap_or(false);
+
+            let mut can_run = false;
+            let mut is_test_project = false;
+
+            if is_csproj {
+                let props =
+                    msbuild_get_properties(&project_path, &["OutputType", "IsTestProject"]).await;
+                if let Some(output_type) = props.get("OutputType") {
+                    let lower = output_type.to_lowercase();
+                    if lower == "exe" || lower == "winexe" {
+                        can_run = true;
+                    }
+                }
+
+                if let Some(is_test) = props.get("IsTestProject") {
+                    if is_test.to_lowercase() == "true" {
+                        is_test_project = true;
+                    }
+                }
+            }
+
+            // Add `dotnet run` only for projects that produce an executable.
+            if can_run {
+                task_templates.push(TaskTemplate {
+                    label: "Run current project".into(),
+                    command: "dotnet".into(),
+                    args: vec![
+                        "run".into(),
+                        "--project".into(),
+                        CS_PROJECT_TASK_VARIABLE.template_value(),
+                    ],
+                    cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
+                    tags: vec!["dotnet-run".to_owned()],
+                    ..TaskTemplate::default()
+                });
+            }
+
+            // Add test tasks only for test projects.
+            if is_test_project {
+                task_templates.push(TaskTemplate {
+                    label: "Test current project".into(),
+                    command: "dotnet".into(),
+                    args: vec!["test".into(), CS_PROJECT_TASK_VARIABLE.template_value()],
+                    cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
+                    tags: vec!["dotnet-test".to_owned()],
+                    ..TaskTemplate::default()
+                });
+
+                task_templates.push(TaskTemplate {
+                    label: "Test (symbol)".to_owned(),
+                    command: "dotnet".into(),
+                    args: vec![
+                        "test".into(),
+                        CS_PROJECT_TASK_VARIABLE.template_value(),
+                        "--filter".into(),
+                        format!(
+                            "FullyQualifiedName~{}",
+                            VariableName::Symbol.template_value()
+                        ),
+                    ],
+                    cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
+                    tags: vec!["dotnet-test-symbol".to_owned()],
+                    ..TaskTemplate::default()
+                });
+            }
+
+            // Restore and publish are always available for identified .NET project context.
+            task_templates.push(TaskTemplate {
+                label: "Restore current project".into(),
                 command: "dotnet".into(),
                 args: vec!["restore".into(), CS_PROJECT_TASK_VARIABLE.template_value()],
                 cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
                 tags: vec!["dotnet-restore".to_owned()],
+                use_new_terminal: false,
+                allow_concurrent_runs: true,
+                reveal: RevealStrategy::Always,
+                reveal_target: RevealTarget::Center,
+                hide: HideStrategy::OnSuccess,
                 ..TaskTemplate::default()
-            },
-            TaskTemplate {
-                label: format!(
-                    "Publish (Release): {}",
-                    CS_PROJECT_TASK_VARIABLE.template_value()
-                ),
+            });
+
+            task_templates.push(TaskTemplate {
+                label: "Publish current project to Release".into(),
                 command: "dotnet".into(),
                 args: vec![
                     "publish".into(),
@@ -464,7 +559,216 @@ impl ContextProvider for CsharpContextProvider {
                 cwd: Some(CS_PROJECT_DIR_TASK_VARIABLE.template_value()),
                 tags: vec!["dotnet-publish".to_owned()],
                 ..TaskTemplate::default()
-            },
-        ])))
+            });
+
+            Some(TaskTemplates(task_templates))
+        })
+    }
+}
+
+async fn msbuild_get_properties(project: &Path, properties: &[&str]) -> HashMap<String, String> {
+    // Run `dotnet msbuild <project> /nologo /v:q /getProperty:...` for all
+    // requested properties in a single invocation and parse the resulting
+    // combined output (JSON or text) for those properties.
+    let mut cmd = util::command::new_smol_command("dotnet");
+    cmd.arg("msbuild").arg(project).arg("/nologo").arg("/v:q");
+    for prop in properties {
+        cmd.arg(format!("/getProperty:{}", prop));
+    }
+
+    let output = match cmd.output().await {
+        Ok(output) => output,
+        Err(e) => {
+            log::debug!("failed to run msbuild to get properties: {e:#}");
+            return HashMap::default();
+        }
+    };
+
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut map = HashMap::default();
+    for prop in properties {
+        if let Some(val) = parse_msbuild_property_output(&combined, prop) {
+            map.insert(prop.to_string(), val);
+        }
+    }
+
+    map
+}
+
+/// Parse MSBuild output and attempt to extract the value of `property`.
+///
+/// This parser supports multiple output formats:
+/// 1. If the command returned JSON with a top-level `Properties` object (e.g.
+///    when multiple properties were requested), that JSON is parsed and the
+///    property is read from `Properties` (preferred).
+/// 2. Otherwise the parser falls back to looking for a line that mentions the
+///    property and extracts a value after `=` or `:` (or the token following the
+///    property name).
+///
+/// Values are sanitized (trimmed, surrounding quotes removed, trailing commas/braces
+/// trimmed) so formats like `"OutputType": "Exe",` are handled correctly.
+///
+/// This helper is pure and unit-testable.
+fn parse_msbuild_property_output(output: &str, property: &str) -> Option<String> {
+    // Prefer JSON output when available.
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(output) {
+        if let Some(props) = json.get("Properties") {
+            if let Some(val) = props.get(property) {
+                if val.is_string() {
+                    return Some(val.as_str().unwrap_or_default().to_string());
+                } else {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+
+    // Helper to normalize crude values like `"Exe",`, `"",` or `Exe}` into `Exe`/``.
+    fn sanitize_property_value(s: &str) -> String {
+        let mut s = s.trim();
+        // Remove trailing commas, braces, and brackets that can appear in inline JSON.
+        s = s.trim_end_matches(|c: char| c == ',' || c == '}' || c == ']' || c.is_whitespace());
+        // Trim again and strip surrounding quotes if present.
+        s = s.trim();
+        if s.starts_with('\"') && s.ends_with('\"') && s.len() >= 2 {
+            s = &s[1..s.len() - 1];
+        }
+        s.trim().to_string()
+    }
+
+    let prop_lower = property.to_lowercase();
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let lower = line.to_lowercase();
+        if lower.contains(&prop_lower) {
+            // Prefer explicit separators and sanitize extracted value.
+            if let Some((_, val)) = line.split_once('=') {
+                return Some(sanitize_property_value(val));
+            }
+            if let Some((_, val)) = line.split_once(':') {
+                return Some(sanitize_property_value(val));
+            }
+
+            // Try the token after the property name: `OutputType Exe`.
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() >= 2 {
+                let prop_idx = tokens
+                    .iter()
+                    .position(|t| t.to_lowercase().contains(&prop_lower));
+                if let Some(idx) = prop_idx {
+                    if idx + 1 < tokens.len() {
+                        return Some(sanitize_property_value(tokens[idx + 1]));
+                    }
+                }
+            }
+
+            // As a last resort return the sanitized whole line.
+            return Some(sanitize_property_value(line));
+        }
+    }
+
+    // If the whole output is a single token (best-effort), return it (sanitized).
+    let non_empty: Vec<&str> = output
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if non_empty.len() == 1 && non_empty[0].split_whitespace().count() == 1 {
+        return Some(sanitize_property_value(non_empty[0]));
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_equals() {
+        let out = "OutputType = Exe\n";
+        assert_eq!(
+            parse_msbuild_property_output(out, "OutputType"),
+            Some("Exe".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_colon() {
+        let out = "OutputType: Exe\n";
+        assert_eq!(
+            parse_msbuild_property_output(out, "OutputType"),
+            Some("Exe".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_value_only() {
+        let out = "Exe\n";
+        assert_eq!(
+            parse_msbuild_property_output(out, "OutputType"),
+            Some("Exe".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_whitespace_value_only() {
+        let out = "   Exe   \n";
+        assert_eq!(
+            parse_msbuild_property_output(out, "OutputType"),
+            Some("Exe".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_case_insensitive() {
+        let out = "Property OutputType: Exe\n";
+        assert_eq!(
+            parse_msbuild_property_output(out, "outputtype"),
+            Some("Exe".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_absent_property_returns_none() {
+        let out = "Some noise\n";
+        assert_eq!(parse_msbuild_property_output(out, "OutputType"), None);
+    }
+
+    #[test]
+    fn parse_json_properties() {
+        let out = r#"{
+  "Properties": {
+    "IsTestProject": "",
+    "OutputType": "Exe"
+  }
+}"#;
+        assert_eq!(
+            parse_msbuild_property_output(out, "OutputType"),
+            Some("Exe".to_string())
+        );
+        assert_eq!(
+            parse_msbuild_property_output(out, "IsTestProject"),
+            Some("".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_is_test_project_true() {
+        let out = "IsTestProject = true\n";
+        assert_eq!(
+            parse_msbuild_property_output(out, "IsTestProject"),
+            Some("true".to_string())
+        );
     }
 }
