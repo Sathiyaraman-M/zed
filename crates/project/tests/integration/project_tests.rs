@@ -126,6 +126,96 @@ async fn test_block_via_smol(cx: &mut gpui::TestAppContext) {
     task.await;
 }
 
+#[gpui::test]
+async fn test_discovered_dotnet_projects(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/proj"),
+        json!({
+            "MySolution.sln": "",
+            "ProjectA": {
+                "ProjectA.csproj": ""
+            },
+            "ProjectB": {
+                "ProjectB.fsproj": ""
+            },
+            "ProjectC": {
+                "ProjectC.vbproj": ""
+            },
+            "global.json": "",
+            "Directory.Build.props": ""
+        }),
+    )
+    .await;
+
+    let project = Project::test(fs.clone(), [path!("/proj").as_ref()], cx).await;
+
+    let discovered: Arc<Mutex<Vec<(worktree::WorktreeId, Vec<worktree::ProjectEntryId>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let discovered_clone = discovered.clone();
+
+    project.update(cx, |_, cx| {
+        let discovered_clone = discovered_clone.clone();
+        cx.subscribe_self(move |_, e, _| {
+            if let Event::DiscoveredProjectFiles(worktree_id, entry_ids) = e {
+                discovered_clone
+                    .lock()
+                    .push((worktree_id.clone(), entry_ids.clone()));
+            }
+        })
+        .detach();
+    });
+
+    let tree = project.read_with(cx, |project, cx| project.worktrees(cx).next().unwrap());
+    tree.flush_fs_events(cx).await;
+
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+
+    let paths = project.read_with(cx, |project, cx| {
+        project.discovered_projects_for_worktree(worktree_id, cx)
+    });
+
+    let names: Vec<String> = paths
+        .iter()
+        .map(|pp| pp.path.as_unix_str().to_string())
+        .collect();
+
+    assert!(
+        names
+            .iter()
+            .any(|n| n.to_ascii_lowercase().ends_with("mysolution.sln"))
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.to_ascii_lowercase().ends_with("projecta.csproj"))
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.to_ascii_lowercase().ends_with("projectb.fsproj"))
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.to_ascii_lowercase().ends_with("projectc.vbproj"))
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.to_ascii_lowercase().ends_with("global.json"))
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.to_ascii_lowercase().ends_with("directory.build.props"))
+    );
+}
+
 // NOTE:
 // While POSIX symbolic links are somewhat supported on Windows, they are an opt in by the user, and thus
 // we assume that they are not supported out of the box.
