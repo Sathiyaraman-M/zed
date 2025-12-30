@@ -79,6 +79,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         ("markdown", tree_sitter_md::LANGUAGE),
         ("markdown-inline", tree_sitter_md::INLINE_LANGUAGE),
         ("python", tree_sitter_python::LANGUAGE),
+        ("razor", tree_sitter_razor::LANGUAGE),
         ("regex", tree_sitter_regex::LANGUAGE),
         ("rust", tree_sitter_rust::LANGUAGE),
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX),
@@ -136,6 +137,11 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
             name: "csharp",
             adapters: vec![csharp_lsp_adapter.clone()],
             context: Some(csharp_context_provider),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "razor",
+            adapters: vec![csharp_lsp_adapter.clone()],
             ..Default::default()
         },
         LanguageInfo {
@@ -291,10 +297,8 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         LanguageServerName("typescript-language-server".into()),
         typescript_lsp_adapter,
     );
-    languages.register_available_lsp_adapter(
-        LanguageServerName("roslyn".into()),
-        csharp_lsp_adapter,
-    );
+    languages
+        .register_available_lsp_adapter(LanguageServerName("roslyn".into()), csharp_lsp_adapter);
 
     languages.register_available_lsp_adapter(python_lsp_adapter.name(), python_lsp_adapter);
     languages.register_available_lsp_adapter(py_lsp_adapter.name(), py_lsp_adapter);
