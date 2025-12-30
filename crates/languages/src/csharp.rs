@@ -238,6 +238,13 @@ impl LspAdapter for CsharpLspAdapter {
         })?;
         Ok(project_options.unwrap_or_default())
     }
+
+    fn language_ids(&self) -> HashMap<LanguageName, String> {
+        HashMap::from_iter([
+            (LanguageName::new_static("CSharp"), "csharp".into()),
+            (LanguageName::new_static("Razor"), "razor".into()),
+        ])
+    }
 }
 
 async fn find_binary_in_dir(dir: &Path, filename: &str) -> Result<PathBuf> {
