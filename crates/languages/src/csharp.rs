@@ -189,7 +189,7 @@ impl LspInstaller for CsharpLspAdapter {
             // Best-effort prefetch of Roslyn; ignore failures.
             let bp = binary_path.clone();
             smol::spawn(async move {
-                let _ = util::command::new_smol_command(&bp)
+                let _ = util::command::new_command(&bp)
                     .arg("--download")
                     .output()
                     .await;
@@ -235,7 +235,7 @@ impl LspAdapter for CsharpLspAdapter {
         let project_options = cx.update(|cx| {
             language_server_settings(delegate.as_ref(), &Self::SERVER_NAME, cx)
                 .and_then(|s| s.settings.clone())
-        })?;
+        });
         Ok(project_options.unwrap_or_default())
     }
 
@@ -577,7 +577,7 @@ async fn msbuild_get_properties(project: &Path, properties: &[&str]) -> HashMap<
     // Run `dotnet msbuild <project> /nologo /v:q /getProperty:...` for all
     // requested properties in a single invocation and parse the resulting
     // combined output (JSON or text) for those properties.
-    let mut cmd = util::command::new_smol_command("dotnet");
+    let mut cmd = util::command::new_command("dotnet");
     cmd.arg("msbuild").arg(project).arg("/nologo").arg("/v:q");
     for prop in properties {
         cmd.arg(format!("/getProperty:{}", prop));

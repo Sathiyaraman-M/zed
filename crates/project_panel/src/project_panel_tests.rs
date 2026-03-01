@@ -123,10 +123,13 @@ async fn test_solution_explorer_opens(cx: &mut gpui::TestAppContext) {
     .await;
 
     let project = Project::test(fs.clone(), [path!("/proj").as_ref()], cx).await;
-    let workspace = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
-    let cx = &mut VisualTestContext::from_window(*workspace, cx);
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
     // instantiate the docked Solution Explorer panel in the workspace and ensure it updates.
-    let panel = workspace.update(cx, SolutionExplorerPanel::new).unwrap();
+    let panel = workspace.update_in(cx, SolutionExplorerPanel::new);
     cx.run_until_parked();
 
     // Check that we have discovered entries for the worktree we seeded.
@@ -149,30 +152,34 @@ async fn test_toggle_solution_explorer_focus(cx: &mut gpui::TestAppContext) {
     .await;
 
     let project = Project::test(fs.clone(), [path!("/proj").as_ref()], cx).await;
-    let workspace = cx.add_window(|window, cx| Workspace::test_new(project.clone(), window, cx));
-    let cx = &mut VisualTestContext::from_window(*workspace, cx);
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+
+    let workspace = window
+        .read_with(cx, |mw, _| mw.workspace().clone())
+        .unwrap();
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
 
     // Create and add the panel to the workspace docks so the action can focus it.
-    let panel = workspace.update(cx, SolutionExplorerPanel::new).unwrap();
-    let _ = workspace.update(cx, |workspace, window, cx| {
+    let panel = workspace.update_in(cx, SolutionExplorerPanel::new);
+    let _ = workspace.update_in(cx, |workspace, window, cx| {
         workspace.add_panel(panel.clone(), window, cx)
     });
     cx.run_until_parked();
 
     // Ensure panel starts unfocused.
-    let _ = workspace.update(cx, |_, window, cx| {
+    let _ = workspace.update_in(cx, |_, window, cx| {
         assert!(!panel.focus_handle(cx).contains_focused(window, cx));
     });
 
     // Toggle the panel - should focus the panel (returns true).
-    let _ = workspace.update(cx, |workspace, window, cx| {
+    let _ = workspace.update_in(cx, |workspace, window, cx| {
         let did_focus = workspace.toggle_panel_focus::<SolutionExplorerPanel>(window, cx);
         assert!(did_focus);
     });
     cx.run_until_parked();
 
     // Toggle again - should unfocus (returns false).
-    let _ = workspace.update(cx, |workspace, window, cx| {
+    let _ = workspace.update_in(cx, |workspace, window, cx| {
         let did_focus = workspace.toggle_panel_focus::<SolutionExplorerPanel>(window, cx);
         assert!(!did_focus);
     });

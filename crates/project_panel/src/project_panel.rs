@@ -450,13 +450,16 @@ pub fn init(cx: &mut App) {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<ProjectPanel>(window, cx);
         });
+        workspace.register_action(|workspace, _: &ToggleSolutionExplorer, window, cx| {
+            workspace.toggle_panel_focus::<SolutionExplorerPanel>(window, cx);
+        });
         workspace.register_action(|workspace, _: &Toggle, window, cx| {
             if !workspace.toggle_panel_focus::<ProjectPanel>(window, cx) {
                 workspace.close_panel::<ProjectPanel>(window, cx);
             }
-        });
-        workspace.register_action(|workspace, _: &ToggleSolutionExplorer, window, cx| {
-            workspace.toggle_panel_focus::<SolutionExplorerPanel>(window, cx);
+            if !workspace.toggle_panel_focus::<SolutionExplorerPanel>(window, cx) {
+                workspace.close_panel::<SolutionExplorerPanel>(window, cx);
+            }
         });
 
         workspace.register_action(|workspace, _: &ToggleHideGitIgnore, _, cx| {
